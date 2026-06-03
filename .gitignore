@@ -49,3 +49,4 @@ models/
 *.h5
 *.keras
 *.onnxmodels/
+*.zip
