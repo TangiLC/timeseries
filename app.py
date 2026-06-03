@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import joblib
+import sqlite3
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -210,6 +211,31 @@ def predict_model(
     return preds[:horizon]
 
 
+def predict_sqlite_approximation(forecast_start_date, future_temps, horizon):
+    conn = sqlite3.connect("timeserie.db")
+    preds = []
+
+    for i in range(horizon):
+        target_date = pd.Timestamp(forecast_start_date) + pd.Timedelta(days=i)
+        is_off = int(target_date.weekday() >= 5)
+
+        result = pd.read_sql_query(
+            """
+            SELECT AVG(consommation_mwh) AS moyenne
+            FROM timeserie
+            WHERE temp_moy_c BETWEEN ? AND ?
+              AND week_end_ferie = ?
+            """,
+            conn,
+            params=(future_temps[i] - 0.2, future_temps[i] + 0.2, is_off),
+        )
+
+        preds.append(result["moyenne"].iloc[0])
+
+    conn.close()
+    return preds
+
+
 st.title("Exploration de CSV quotidiens")
 
 with st.sidebar:
@@ -294,17 +320,29 @@ if do_compute:
                 )
                 exog_preview[model_name] = X_future.reset_index(names="date")
 
-            forecasts[model_name] = predict_model(
-                model=model,
-                exog_cols=exog_cols,
-                X_future=X_future,
-                horizon=horizon,
+            forecasts[model_name] = (
+                [
+                    v * 24 if model_name.startswith("Hmw") and v is not None else v
+                    for v in predict_model(
+                        model=model,
+                        exog_cols=exog_cols,
+                        X_future=X_future,
+                        horizon=horizon,
+                    )
+                ]
+                if not model_name.startswith("Dmw")
+                else predict_model(
+                    model=model, exog_cols=exog_cols, X_future=X_future, horizon=horizon
+                )
             )
 
         except Exception as e:
             forecasts[model_name] = [None] * horizon
             forecast_errors[model_name] = str(e)
 
+    forecasts["approximation sqlite"] = predict_sqlite_approximation(
+        forecast_start_date, future_temps, horizon
+    )
     st.session_state["forecast_cache"] = forecasts
     st.session_state["forecast_errors"] = forecast_errors
     st.session_state["exog_preview"] = exog_preview
@@ -440,9 +478,38 @@ for model_name, preds in (forecasts or {}).items():
     )
 
 results = pd.DataFrame(rows)
+model_colors = {
+    m: px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)]
+    for i, m in enumerate(results["modele"].dropna().unique())
+}
 
 if not results.empty:
-    st.dataframe(results, width="stretch")
+    st.dataframe(
+        results.style.apply(
+            lambda r: [f"background-color: {model_colors.get(r['modele'], '')}22"]
+            * len(r),
+            axis=1,
+        ),
+        width="stretch",
+    )
+    st.header("Graphiques de prévision par modèle")
+
+plot_df = results.dropna(subset=["modele"]).copy()
+
+for col, title in [
+    ("conso_mwh_j+1", "Prévisions J+1 par modèle"),
+    ("conso_mwh_j+3", "Prévisions J+3 par modèle"),
+]:
+    fig = px.scatter(
+        plot_df,
+        x="modele",
+        y=col,
+        color="modele",
+        color_discrete_map=model_colors,
+        title=title,
+    )
+    fig.update_traces(marker=dict(size=12))
+    st.plotly_chart(fig, width="stretch")
 else:
     st.info(
         "Aucun résultat de prévision disponible. Cliquez sur 'Recalc forecast' ou activez le calcul automatique."
